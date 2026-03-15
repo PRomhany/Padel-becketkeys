@@ -430,4 +430,3 @@ function InfoTile({ title, value }) {
     </div>
   );
 }
-
