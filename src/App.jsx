@@ -5,7 +5,7 @@ import "./styles.css";
 const SCHOOL_NAME = "Becket Keys School";
 const ALLOWED_DOMAIN = "@becketkeys.org";
 const ADMIN_EMAILS = ["p.romhany@becketkeys.org"];
-const STORAGE_KEY = "becket_keys_padel_bookings_v1";
+const COURT = "Court 1";
 
 const SLOT_DEFS = [
   { label: "07:00–07:30", session: "Morning" },
@@ -14,6 +14,9 @@ const SLOT_DEFS = [
   { label: "16:00–16:30", session: "After school" },
   { label: "16:30–17:00", session: "After school" },
 ];
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 function nextSchoolDays(count = 10) {
   const out = [];
@@ -46,17 +49,30 @@ function formatDate(date) {
   });
 }
 
-const seedBookings = [
-  {
-    id: "seed-1",
-    email: "teacher1@becketkeys.org",
-    name: "A. Teacher",
-    players: ["A. Teacher", "B. Teacher"],
-    date: dateKey(nextSchoolDays(1)[0]),
-    slot: "07:00–07:30",
-    court: "Court 1",
-  },
-];
+function envReady() {
+  return Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+      ...(options.headers || {}),
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || "Request failed");
+  }
+
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
 
 export default function App() {
   const [email, setEmail] = useState("");
@@ -66,36 +82,45 @@ export default function App() {
   const [player3, setPlayer3] = useState("");
   const [player4, setPlayer4] = useState("");
   const [loggedInUser, setLoggedInUser] = useState(null);
-  const [bookings, setBookings] = useState(seedBookings);
+  const [bookings, setBookings] = useState([]);
   const [selectedDate, setSelectedDate] = useState(dateKey(nextSchoolDays(1)[0]));
   const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState("book");
 
   const schoolDays = useMemo(() => nextSchoolDays(10), []);
   const isAdmin = loggedInUser && ADMIN_EMAILS.includes(loggedInUser.email.toLowerCase());
 
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) setBookings(parsed);
-      } catch {}
-    }
+    loadBookings();
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(bookings));
-  }, [bookings]);
+  async function loadBookings() {
+    if (!envReady()) {
+      setMessage("Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in Vercel, then redeploy.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = await api("bookings?select=*&order=date.asc&order=slot.asc");
+      setBookings(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setMessage(`Could not load shared bookings: ${cleanError(error)}`);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   function login() {
     const cleanEmail = email.trim().toLowerCase();
     const cleanName = name.trim();
+
     if (!cleanName) return setMessage("Please enter your name.");
     if (!cleanEmail) return setMessage("Please enter your school email.");
     if (!cleanEmail.endsWith(ALLOWED_DOMAIN)) {
       return setMessage(`Only ${SCHOOL_NAME} staff can log in.`);
     }
+
     setLoggedInUser({ email: cleanEmail, name: cleanName });
     setPlayer1(cleanName);
     setPlayer2("");
@@ -117,21 +142,42 @@ export default function App() {
     return bookings.find((b) => b.date === date && b.slot === slot && b.court === court);
   }
 
-  function addBooking(slot, court) {
+  async function addBooking(slot, court) {
     if (!loggedInUser) return;
-    if (bookings.some((b) => b.date === selectedDate && b.slot === slot && b.email === loggedInUser.email)) {
-      return setMessage("You already have a booking in that slot.");
+    if (!envReady()) {
+      return setMessage("Supabase environment variables are missing in Vercel.");
     }
-    if (bookingOwner(selectedDate, slot, court)) {
-      return setMessage("That court is already booked.");
-    }
-    const players = [player1, player2, player3, player4].map((p) => p.trim()).filter(Boolean).slice(0, 4);
+
+    const players = [player1, player2, player3, player4]
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+
     if (players.length < 2) {
       return setMessage("Please add at least one other member of staff so we can track who is playing.");
     }
-    const next = [
-      ...bookings,
-      {
+
+    if (bookings.some((b) => b.date === selectedDate && b.slot === slot && b.email === loggedInUser.email)) {
+      return setMessage("You already have a booking in that slot.");
+    }
+
+    if (bookingOwner(selectedDate, slot, court)) {
+      return setMessage("That court is already booked.");
+    }
+
+    setLoading(true);
+    try {
+      // Re-check against the shared database to help prevent double booking.
+      const existing = await api(
+        `bookings?select=id&date=eq.${encodeURIComponent(selectedDate)}&slot=eq.${encodeURIComponent(slot)}&court=eq.${encodeURIComponent(court)}`
+      );
+
+      if (Array.isArray(existing) && existing.length > 0) {
+        await loadBookings();
+        return setMessage("That court has just been booked by someone else.");
+      }
+
+      const payload = {
         id: crypto.randomUUID(),
         email: loggedInUser.email,
         name: loggedInUser.name,
@@ -139,26 +185,47 @@ export default function App() {
         date: selectedDate,
         slot,
         court,
-      },
-    ];
-    setBookings(next);
-    setMessage(`Booked ${court} for ${slot}.`);
+      };
+
+      const inserted = await api("bookings", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      setBookings((prev) => [...prev, ...(inserted || [])].sort(sortBookings));
+      setMessage(`Booked ${court} for ${slot}.`);
+    } catch (error) {
+      setMessage(`Booking failed: ${cleanError(error)}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function cancelBooking(id) {
-    setBookings((prev) => prev.filter((b) => b.id !== id));
-    setMessage("Booking cancelled.");
+  async function cancelBooking(id) {
+    if (!envReady()) {
+      return setMessage("Supabase environment variables are missing in Vercel.");
+    }
+    setLoading(true);
+    try {
+      await api(`bookings?id=eq.${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      setBookings((prev) => prev.filter((b) => b.id !== id));
+      setMessage("Booking cancelled.");
+    } catch (error) {
+      setMessage(`Cancellation failed: ${cleanError(error)}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
   const myBookings = loggedInUser
     ? bookings
         .filter((b) => b.email === loggedInUser.email)
-        .sort((a, b) => `${a.date} ${a.slot}`.localeCompare(`${b.date} ${b.slot}`))
+        .sort(sortBookings)
     : [];
 
-  const allBookingsSorted = [...bookings].sort((a, b) =>
-    `${a.date} ${a.slot} ${a.court}`.localeCompare(`${b.date} ${b.slot} ${b.court}`)
-  );
+  const allBookingsSorted = [...bookings].sort(sortBookings);
 
   return (
     <div className="page">
@@ -169,19 +236,19 @@ export default function App() {
               <div className="logo-box">BK</div>
               <div>
                 <h1>{SCHOOL_NAME} Padel Booking</h1>
-                <p>Staff-only web booking app for morning and after-school court use.</p>
+                <p>Shared staff booking system for morning and after-school court use.</p>
               </div>
             </div>
             <div className="info-grid">
               <InfoTile title="Bookable times" value="07:00–08:00 and 15:30–17:00" />
               <InfoTile title="Access" value={`Restricted to ${ALLOWED_DOMAIN}`} />
-              <InfoTile title="Courts" value="Court 1" />
+              <InfoTile title="Court" value={COURT} />
             </div>
           </section>
 
           <section className="card">
             <h2>Staff sign in</h2>
-            <p className="muted">This trial version uses email-domain restriction.</p>
+            <p className="muted">Shared version using Supabase for bookings.</p>
             {!loggedInUser ? (
               <>
                 <input className="input" placeholder="Full name" value={name} onChange={(e) => setName(e.target.value)} />
@@ -204,6 +271,7 @@ export default function App() {
         </div>
 
         {message && <div className="alert">{message}</div>}
+        {loading && <div className="notice">Working…</div>}
 
         <div className="tabs">
           <button className={tab === "book" ? "tab active" : "tab"} onClick={() => setTab("book")}>Book</button>
@@ -250,14 +318,14 @@ export default function App() {
                   <h3>{session}</h3>
                   <p className="muted">{session === "Morning" ? "Before school: 07:00–08:00" : "After school: 15:30–17:00"}</p>
                   {SLOT_DEFS.filter((s) => s.session === session).map((slot) => {
-                    const owner = bookingOwner(selectedDate, slot.label, "Court 1");
+                    const owner = bookingOwner(selectedDate, slot.label, COURT);
                     const mine = owner?.email === loggedInUser?.email;
                     return (
                       <div key={slot.label} className="slot-box">
                         <div className="slot-head">
                           <div>
                             <div className="strong">{slot.label}</div>
-                            <div className="small">Court 1</div>
+                            <div className="small">{COURT}</div>
                           </div>
                           <span className="badge secondary">{owner ? "Booked" : "Available"}</span>
                         </div>
@@ -273,8 +341,8 @@ export default function App() {
                             )}
                           </div>
                         ) : (
-                          <button className="button primary" disabled={!loggedInUser} onClick={() => addBooking(slot.label, "Court 1")}>
-                            Book Court 1
+                          <button className="button primary" disabled={!loggedInUser || loading} onClick={() => addBooking(slot.label, COURT)}>
+                            Book {COURT}
                           </button>
                         )}
                       </div>
@@ -341,6 +409,19 @@ export default function App() {
   );
 }
 
+function sortBookings(a, b) {
+  return `${a.date} ${a.slot} ${a.court}`.localeCompare(`${b.date} ${b.slot} ${b.court}`);
+}
+
+function cleanError(error) {
+  try {
+    const text = typeof error?.message === "string" ? error.message : String(error);
+    return text.slice(0, 180);
+  } catch {
+    return "Unknown error";
+  }
+}
+
 function InfoTile({ title, value }) {
   return (
     <div className="tile">
@@ -349,3 +430,4 @@ function InfoTile({ title, value }) {
     </div>
   );
 }
+
